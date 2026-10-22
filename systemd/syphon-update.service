@@ -1,0 +1,8 @@
+[Unit]
+Description=Syphon update runner (checks for, verifies and installs a new version)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/syphon-update run
+TimeoutStartSec=3600
