@@ -1,0 +1,38 @@
+[Unit]
+Description=Syphon mesh media server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=syphon
+Group=syphon
+# make sure the folder the web page uses to talk to the root helper belongs to the service user (runs as root, before the program starts)
+ExecStartPre=+/bin/sh -c 'install -d -o syphon -g syphon -m 0755 /var/lib/syphon/update /var/lib/syphon/update/requests && chown syphon:syphon /var/lib/syphon/update /var/lib/syphon/update/requests'
+ExecStart=/usr/local/bin/syphon --dir /var/lib/syphon run
+# "Always on" nodes may lose power or crash at any time: come straight back. (syphon-ctl persistence
+# off changes this to on-failure.) After a restart the library stays locked until the owner signs in.
+Restart=always
+RestartSec=5
+# exit code 3 = "this node was removed on purpose": do not start it again
+RestartPreventExitStatus=3
+# A clean stop (power button, shutdown, systemctl stop) sends SIGTERM; Syphon finishes what is in
+# flight, saves its state and stops Tor. Give it time before anything is forced.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+# a memory-only folder that carries the library key across an update restart (see src/handoff.rs)
+RuntimeDirectory=syphon-handoff
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# drives under /mnt, /media and /srv (and NAS mounts) are writable too; other places are added by the helper
+ReadWritePaths=/var/lib/syphon -/mnt -/media -/srv
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

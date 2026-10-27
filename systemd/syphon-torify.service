@@ -1,0 +1,16 @@
+[Unit]
+Description=Syphon: send this computer's traffic through Tor (system-wide)
+# Loaded before the network comes up, so nothing can leave around Tor while it starts.
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '/usr/local/bin/syphon --dir /var/lib/syphon torify-rules --uid "$(id -u syphon)" | /usr/sbin/nft -f -'
+ExecStop=-/usr/sbin/nft delete table inet syphon_torify
+
+[Install]
+WantedBy=multi-user.target

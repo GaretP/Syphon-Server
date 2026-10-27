@@ -1,0 +1,103 @@
+/* Syphon on a TV: everything big, one thing focused at a time, readable from the sofa. Sizes follow the screen width.
+   Matte: solid colours, crisp edges, a plain white frame on whatever is focused. No glow, blur, fades or see-through layers. */
+body.tv { font-size: clamp(15px, 1.15vw, 34px); background: #17161b; color: #ece9f3; overflow: hidden; }
+body.tv.tv-nocursor, body.tv.tv-nocursor * { cursor: none !important; }
+body.tv *:focus { outline: none; }
+
+.tv-page { height: 100vh; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; padding-bottom: 4em; background: #17161b; }
+.tv-page::-webkit-scrollbar { display: none; }
+
+.tv-top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 1.2em; padding: 0.9em 3.2em; background: #17161b; border-bottom: 1px solid #2c2a33; }
+.tv-brand svg { width: 1.9em; height: 1.9em; display: block; }
+.tv-node { font-weight: 600; font-size: 1.2em; }
+.tv-clock { color: #aaa6b7; font-variant-numeric: tabular-nums; }
+.tv-top .grow { flex: 1; }
+.tv-who { display: flex; align-items: center; gap: 0.6em; padding: 0.3em 0.9em 0.3em 0.3em; border-radius: 999px; border: 3px solid transparent;
+  background: #25232b; color: inherit; font: inherit; cursor: pointer; }
+.tv-who .avatar { --s: 2.1em !important; }
+
+.tv-btn { font: inherit; font-weight: 600; padding: 0.65em 1.5em; border-radius: 0.45em; border: 3px solid transparent; cursor: pointer;
+  background: #2c2a33; color: inherit; }
+.tv-btn.primary { background: #9f8bd2; color: #1a1524; }
+.tv-btn.ghost { background: transparent; color: #cfcbe0; }
+/* focus: a solid white frame, slightly larger; nothing glows */
+[data-nav]:focus, .tv-who:focus { border-color: #ffffff; transform: scale(1.04); }
+
+/* the top of home: what is focused, on a plain panel, with its poster framed beside the text */
+.tv-hero { position: relative; display: flex; align-items: flex-end; gap: 2em; min-height: 13em; height: 34vh; padding: 1.4em 3.2em; background: #1f1e25; border-bottom: 1px solid #2c2a33; }
+.tv-hero-bg { order: 2; flex: none; height: 100%; aspect-ratio: 2 / 3; border-radius: 0.5em; overflow: hidden; background: hsl(var(--h, 270) 24% 32%); border: 1px solid #3a3842; }
+.tv-hero-bg:empty { display: none; }
+.tv-hero-bg img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tv-hero-text { flex: 1; max-width: 60%; }
+.tv-hero h1 { font-size: 2.4em; margin: 0 0 0.25em; line-height: 1.1; }
+.tv-meta { color: #bdb8cd; margin: 0 0 0.5em; }
+.tv-overview { color: #cfcbdd; line-height: 1.45; margin: 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+.tv-page.tv-home { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 0; }
+.tv-home .tv-hero { flex: none; }
+.tv-rows { padding: 0.6em 0 4em; }
+.tv-home .tv-rows { flex: 1; overflow-y: auto; scrollbar-width: none; }
+.tv-home .tv-rows::-webkit-scrollbar { display: none; }
+.tv-row { margin: 0 0 0.4em; }
+.tv-row h2 { font-size: 1.2em; font-weight: 600; margin: 0.4em 3.2em 0; color: #e1ddec; }
+.tv-rail { display: flex; gap: 1em; overflow-x: auto; overflow-y: visible; padding: 1em 3.2em; scroll-padding: 0 3.2em; scrollbar-width: none; }
+.tv-rail::-webkit-scrollbar { display: none; }
+
+/* a poster: the artwork (or a flat colour card), the title on a solid strip */
+.tv-card { position: relative; flex: none; width: 10.5em; aspect-ratio: 2 / 3; border-radius: 0.5em; overflow: hidden; border: 3px solid #2c2a33; padding: 0;
+  cursor: pointer; color: #fff; font: inherit; text-align: left; background: hsl(var(--h) 24% 32%); transition: transform 0.12s ease; }
+.tv-card img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.tv-card-name { position: absolute; left: 0; right: 0; bottom: 0; padding: 0.5em 0.6em; font-weight: 600; line-height: 1.2; background: #1f1e25; }
+.tv-card-tag { position: absolute; top: 0.5em; left: 0.5em; font-size: 0.75em; padding: 0.2em 0.55em; border-radius: 0.3em; background: #1f1e25; }
+.tv-card-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 0.3em; background: #3a3842; }
+.tv-card-bar i { display: block; height: 100%; background: #9f8bd2; }
+.tv-card:focus { transform: scale(1.08); border-color: #ffffff; z-index: 2; }
+
+/* one show or film */
+.tv-detail-head { display: flex; gap: 2.5em; padding: 1.4em 3.2em 1.5em; align-items: flex-end; }
+.tv-art { flex: none; width: 15em; aspect-ratio: 2 / 3; border-radius: 0.6em; overflow: hidden; display: grid; place-items: center; text-align: center; padding: 1em;
+  font-weight: 600; font-size: 1.1em; background: hsl(var(--h) 24% 32%); border: 1px solid #3a3842; }
+.tv-art:has(img) { padding: 0; }
+.tv-art img { width: 100%; height: 100%; object-fit: cover; }
+.tv-detail-text { max-width: 60%; }
+.tv-detail-text h1 { font-size: 2.4em; margin: 0 0 0.3em; line-height: 1.1; }
+.tv-actions { display: flex; gap: 1em; margin-top: 1.2em; }
+.tv-seasons { padding-top: 0.2em; padding-bottom: 0.6em; }
+.tv-pill { flex: none; font: inherit; padding: 0.45em 1.2em; border-radius: 999px; border: 3px solid transparent; background: #25232b; color: #d7d3e4; cursor: pointer; }
+.tv-pill.on { background: #3a3448; color: #fff; }
+.tv-eps { display: flex; flex-direction: column; gap: 0.45em; padding: 0.4em 3.2em; }
+.tv-ep { display: flex; align-items: center; gap: 1.4em; padding: 0.75em 1.2em; border-radius: 0.5em; border: 3px solid transparent; font: inherit; color: inherit;
+  background: #1f1e25; text-align: left; cursor: pointer; }
+.tv-ep:focus { background: #2c2938; transform: none; }
+.tv-ep.away { color: #8e8a9b; }
+.tv-ep-num { min-width: 5.5em; color: #b6a6e2; font-variant-numeric: tabular-nums; font-weight: 600; }
+.tv-ep-name { flex: 1; }
+.tv-ep-state { color: #a9a6b6; font-size: 0.85em; }
+
+/* the player: the picture, and when called up, a solid bar along the bottom */
+.tv-player { position: fixed; inset: 0; background: #000; }
+.tv-video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+.tv-osd { position: absolute; left: 0; right: 0; bottom: 0; padding: 1.4em 3.2em 1.6em; background: #17161b; border-top: 1px solid #2c2a33;
+  visibility: hidden; pointer-events: none; }
+.tv-osd.on { visibility: visible; }
+.tv-osd h2 { margin: 0 0 0.8em; font-size: 1.3em; font-weight: 600; }
+.tv-progress { height: 0.4em; border-radius: 0.2em; background: #3a3842; overflow: hidden; }
+.tv-progress i { display: block; height: 100%; background: #9f8bd2; }
+.tv-times { display: flex; justify-content: space-between; margin-top: 0.5em; font-variant-numeric: tabular-nums; color: #ddd; }
+.tv-state { font-weight: 600; }
+.tv-hint { color: #9f9bb0; font-size: 0.85em; margin: 0.8em 0 0; }
+.tv-next { position: absolute; right: 3.2em; bottom: 9.5em; padding: 1.2em 1.6em; border-radius: 0.6em; background: #1f1e25; border: 2px solid #9f8bd2; max-width: 28em; }
+.tv-next.hidden { display: none; }
+.tv-next small { display: block; color: #b6a6e2; text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.75em; }
+.tv-next b { display: block; font-size: 1.2em; margin: 0.2em 0 0.5em; }
+.tv-next span { color: #a9a6b6; font-size: 0.85em; }
+
+/* menus and messages: a plain screen of their own */
+.tv-menu { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: #121116; font-size: clamp(15px, 1.15vw, 34px); }
+.tv-menu-box { display: flex; flex-direction: column; gap: 0.8em; min-width: 20em; padding: 2em; border-radius: 0.6em; background: #1f1e25; border: 1px solid #3a3842; }
+.tv-menu-box h2 { margin: 0 0 0.4em; font-size: 1.4em; }
+.tv-search { font: inherit; font-size: 1.2em; padding: 0.6em 0.9em; border-radius: 0.45em; border: 3px solid #3a3842; background: #17161b; color: inherit; }
+.tv-search:focus { border-color: #fff; }
+.tv-empty { display: grid; place-items: center; align-content: center; gap: 1em; min-height: 60vh; text-align: center; color: #bdb8cd; }
+.tv-empty h1 { color: #ece9f3; margin: 0; }
+@media (prefers-reduced-motion: reduce) { .tv-card, .tv-btn { transition: none; } [data-nav]:focus, .tv-card:focus { transform: none; } }
