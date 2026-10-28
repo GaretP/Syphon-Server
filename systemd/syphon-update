@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# syphon-update: fetch, verify and install a new Syphon version. Runs as root, started by
+# syphon-update.service when the node (or you) asks for it.
+#
+#   syphon-update check | apply | rollback     do it now
+#   syphon-update run                          handle the requests the web page dropped off
+#
+# How a release is trusted: you build the program on your own computer and sign a small manifest (version, file
+# names, SHA-256 hashes, sizes) with your private key. This script only installs a program whose manifest
+# carries a valid signature from a key in /etc/syphon/allowed_signers, whose archive matches the signed hash and
+# size, and whose version is newer than the one running. Nothing is compiled on the node and nothing from the
+# download runs as root. Before installing it saves a copy of the database; if the new version does not come up
+# the old program is put back (and the database too, if that is what it takes).
+set -uo pipefail
+ETC="${SYPHON_ETC:-/etc/syphon}"
+BINDIR="${SYPHON_BINDIR:-/usr/local/bin}"
+RUNDIR="${SYPHON_RUN:-/run}"
+CONF="$ETC/update.conf"
+REPO=""; BASE=""; SIGNERS="$ETC/allowed_signers"; SIGNER_ID="release"; ROUTE=tor; SOCKS="127.0.0.1:9250"; DATA=/var/lib/syphon
+[[ -f "$CONF" ]] && . "$CONF"
+# where releases live: <BASE>/latest/download/manifest.txt and <BASE>/download/<version>/<file>
+[[ -z "$BASE" && -n "$REPO" ]] && BASE="${REPO%.git}/releases"
+BIN="$BINDIR/syphon"; UPD="$DATA/update"
+HANDOFF="$RUNDIR/syphon-handoff"
+SNAPS="$UPD/snapshots"
+export GIT_TERMINAL_PROMPT=0 PATH="/usr/local/bin:$PATH"
+mkdir -p "$UPD/requests"; chown -R syphon:syphon "$UPD" 2>/dev/null || true
+WORK=""
+cleanup() { [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"; }
+trap cleanup EXIT
+
+clean() { printf '%s' "$1" | tr -d '"\\' | tr '\n\r\t' '   ' | cut -c1-300; }
+status() { # state, message, [latest]
+  local tmp; tmp="$(mktemp "$UPD/.st.XXXXXX")"
+  printf '{"state":"%s","message":"%s","latest":"%s","updated":%s}\n' "$1" "$(clean "$2")" "$(clean "${3:-}")" "$(date +%s)" >"$tmp"
+  chown syphon:syphon "$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" "$UPD/status.json"
+}
+current() { "$BIN" --version 2>/dev/null | awk '{print $2}'; }
+newer() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+machine() { case "$(uname -m)" in x86_64|amd64) echo x86_64 ;; aarch64|arm64) echo aarch64 ;; *) uname -m ;; esac; }
+
+fetch() { # url file [max-bytes]: https only, through Tor unless told otherwise
+  local a=(curl -fsS -L --connect-timeout 60 --max-time 3600 --retry 2)
+  case "$BASE" in
+    https://*) a+=(--proto '=https' --proto-redir '=https' --tlsv1.2)
+               [[ "$ROUTE" == "tor" ]] && a+=(--socks5-hostname "$SOCKS") ;;
+    file://*) ;;  # local folder: for tests only
+    *) return 1 ;;
+  esac
+  [[ -n "${3:-}" ]] && a+=(--max-filesize "$3")
+  "${a[@]}" -o "$2" "$1" 2>"$WORK/curl.err"
+}
+
+# Sets LATEST, ASSET, SHA, SIZE (the release for this computer) after checking the signature. Non-zero with a status on failure.
+fetch_latest() {
+  [[ -n "$BASE" ]] || { status failed "No update source is set. Run: sudo syphon-ctl update-source set <repository address> --signers <file>"; return 1; }
+  [[ -s "$SIGNERS" ]] || { status failed "No signing key is installed on this node, so no release can be trusted. Run: sudo syphon-ctl update-source set <address> --signers <file>"; return 1; }
+  WORK="$(mktemp -d /var/tmp/syphon-update.XXXXXX)"; chmod 0755 "$WORK"
+  fetch "$BASE/latest/download/manifest.txt" "$WORK/manifest.txt" 65536 && fetch "$BASE/latest/download/manifest.txt.sig" "$WORK/manifest.txt.sig" 8192 \
+    || { status failed "Could not fetch the release list (is Tor connected? has a release been published?): $(head -c 160 "$WORK/curl.err")"; return 1; }
+  [[ "$(stat -c %s "$WORK/manifest.txt")" -le 65536 ]] || { status failed "The release list is too large, so it was ignored."; return 1; }
+  if ! ssh-keygen -Y verify -f "$SIGNERS" -I "$SIGNER_ID" -n syphon-release -s "$WORK/manifest.txt.sig" <"$WORK/manifest.txt" >/dev/null 2>&1; then
+    status failed "The release list is not signed by your signing key, so nothing was installed."; return 1
+  fi
+  [[ "$(head -n1 "$WORK/manifest.txt")" == "syphon-release 1" ]] || { status failed "The release list is in a format this node does not understand."; return 1; }
+  LATEST="$(awk '$1=="version"{print $2; exit}' "$WORK/manifest.txt")"
+  [[ "$LATEST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { status failed "The release list has an invalid version."; return 1; }
+  REQUIRES="$(awk '$1=="requires"{print $2; exit}' "$WORK/manifest.txt")"
+  local arch line; arch="$(machine)"
+  line="$(awk -v a="$arch" '$1=="file" && $3=="sha256" && $5=="size" && $7=="arch" && $8==a {print; exit}' "$WORK/manifest.txt")"
+  if [[ -z "$line" ]]; then status failed "Release $LATEST has no program for this computer ($arch)." "$LATEST"; return 1; fi
+  read -r _ ASSET _ SHA _ SIZE _ _ <<<"$line"
+  [[ "$ASSET" =~ ^syphon-v[0-9]+\.[0-9]+\.[0-9]+-[a-z0-9_]+-linux\.tar\.gz$ && "$SHA" =~ ^[0-9a-f]{64}$ && "$SIZE" =~ ^[0-9]{1,9}$ && "$SIZE" -le 314572800 ]] \
+    || { status failed "The release list has an invalid file entry."; return 1; }
+  return 0
+}
+
+do_check() {
+  status checking "Looking for a new version…"
+  fetch_latest || return 0
+  local cur; cur="$(current)"
+  if newer "$LATEST" "$cur"; then status available "Version $LATEST is ready (you have $cur)." "$LATEST"
+  else status uptodate "You are up to date ($cur)." "$LATEST"; fi
+}
+
+healthy() {
+  local port code
+  port="$(grep -E '^access_bind' "$DATA/config.toml" 2>/dev/null | sed -E 's/.*:([0-9]+)".*/\1/')"; port="${port:-8096}"
+  for _ in $(seq 1 "${HEALTH_TRIES:-60}"); do
+    code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$port/api/me" 2>/dev/null)"
+    [[ "$code" == "200" || "$code" == "401" ]] && return 0
+    sleep "${HEALTH_WAIT:-2}"
+  done
+  return 1
+}
+unlocked() {
+  local port; port="$(grep -E '^access_bind' "$DATA/config.toml" 2>/dev/null | sed -E 's/.*:([0-9]+)".*/\1/')"; port="${port:-8096}"
+  curl -s -m 3 "http://127.0.0.1:$port/api/status" 2>/dev/null | grep -q '"locked":false'
+}
+was_unlocked() { # before restarting: is the library open right now?
+  unlocked
+}
+
+# Restart the node and let it keep the library unlocked: the running node leaves its key in memory-only storage
+# when it sees the "arm" file, and the next start picks it up.
+restart_node() {
+  rm -rf "$HANDOFF"/key "$HANDOFF"/arm 2>/dev/null
+  if [[ "${1:-}" == "handoff" ]]; then
+    install -d -o syphon -g syphon -m 0700 "$HANDOFF" 2>/dev/null
+    : >"$HANDOFF/arm"; chown syphon:syphon "$HANDOFF/arm" 2>/dev/null; chmod 0600 "$HANDOFF/arm"
+  fi
+  systemctl restart syphon
+  rm -f "$HANDOFF/arm" "$HANDOFF/key" 2>/dev/null
+}
+
+ensure_dropins() { # the memory-only folder the key hand-over uses
+  install -d /etc/systemd/system/syphon.service.d 2>/dev/null || return 0
+  printf '[Service]\nRuntimeDirectory=syphon-handoff\nRuntimeDirectoryMode=0700\nRuntimeDirectoryPreserve=restart\n' >/etc/systemd/system/syphon.service.d/10-handoff.conf
+  systemctl daemon-reload 2>/dev/null
+}
+
+snapshot_db() { # name -> $SNAPS/<name>
+  install -d -o syphon -g syphon -m 0700 "$SNAPS" 2>/dev/null
+  local d="$SNAPS/$1"
+  rm -rf "$d"
+  runuser -u syphon -- "$BIN" --dir "$DATA" snapshot --to "$d" >/tmp/syphon-update.err 2>&1 || return 1
+  [[ -s "$d/syphon.db" ]] || return 1
+  # keep the three newest
+  ls -1dt "$SNAPS"/*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf
+  return 0
+}
+restore_db() { # name: put the saved database and key files back (the node must be stopped)
+  local d="$SNAPS/$1"; [[ -s "$d/syphon.db" ]] || return 1
+  systemctl stop syphon
+  rm -f "$DATA/syphon.db" "$DATA/syphon.db-wal" "$DATA/syphon.db-shm"
+  for f in "$d"/*; do cp -f "$f" "$DATA/$(basename "$f")"; chown syphon:syphon "$DATA/$(basename "$f")"; done
+  return 0
+}
+
+do_apply() {
+  status checking "Looking for a new version…"
+  fetch_latest || return 0
+  local cur; cur="$(current)"
+  if ! newer "$LATEST" "$cur"; then status uptodate "You are up to date ($cur)." "$LATEST"; return 0; fi
+  if [[ -n "${REQUIRES:-}" ]] && newer "$REQUIRES" "$cur"; then
+    status failed "Version $LATEST needs $REQUIRES installed first. Update to $REQUIRES, then to $LATEST." "$LATEST"; return 0
+  fi
+  local free; free="$(df -Pk /var/tmp | awk 'NR==2{print $4*1024}')"
+  [[ "${free:-0}" -gt $((SIZE * 4)) ]] || { status failed "Not enough free space to unpack $LATEST (about $((SIZE * 4 / 1048576)) MB needed in /var/tmp)." "$LATEST"; return 0; }
+
+  status building "Downloading $LATEST ($((SIZE / 1048576)) MB). The node keeps running meanwhile." "$LATEST"
+  fetch "$BASE/download/$LATEST/$ASSET" "$WORK/$ASSET" "$SIZE" || { status failed "The download failed: $(head -c 160 "$WORK/curl.err")" "$LATEST"; return 0; }
+  [[ "$(stat -c %s "$WORK/$ASSET")" == "$SIZE" ]] || { status failed "The download is not the size the signed release list says, so it was thrown away." "$LATEST"; return 0; }
+  [[ "$(sha256sum "$WORK/$ASSET" | cut -d' ' -f1)" == "$SHA" ]] || { status failed "The download does not match the signed checksum, so it was thrown away." "$LATEST"; return 0; }
+
+  # unpack only the three expected files, as plain files with plain names
+  local x="$WORK/x" names bad=0 line
+  mkdir -p "$x"; chmod 0755 "$x"
+  while IFS= read -r line; do
+    case "$line" in
+      -*" syphon"|-*" syphon-update"|-*" syphon-ctl"|-*" ./syphon"|-*" ./syphon-update"|-*" ./syphon-ctl") ;;
+      *) bad=1 ;;
+    esac
+  done < <(tar -tvzf "$WORK/$ASSET" 2>/dev/null)
+  [[ $bad -eq 0 ]] || { status failed "The release archive holds something unexpected, so nothing was installed." "$LATEST"; return 0; }
+  tar -xzf "$WORK/$ASSET" -C "$x" --no-same-owner --no-same-permissions 2>/dev/null || { status failed "The release archive could not be unpacked." "$LATEST"; return 0; }
+  for n in syphon syphon-update syphon-ctl; do [[ -f "$x/$n" && ! -L "$x/$n" ]] || { status failed "The release archive is missing $n." "$LATEST"; return 0; }; done
+  chmod 0755 "$x/syphon" "$x/syphon-update" "$x/syphon-ctl"
+  # the new program says which version it is; run it as the node's own account, never as root
+  local said; said="$(runuser -u syphon -- "$x/syphon" --version 2>/dev/null | awk '{print $2}')"
+  [[ "$said" == "$LATEST" ]] || { status failed "The new program reports version '${said:-nothing}', not $LATEST, so nothing was installed." "$LATEST"; return 0; }
+
+  status installing "Saving a copy of the database…" "$LATEST"
+  local snap="before-$cur-$(date +%s)"
+  snapshot_db "$snap" || { status failed "Could not save a copy of the database first ($(head -c 120 /tmp/syphon-update.err)), so nothing was changed." "$LATEST"; return 0; }
+
+  status installing "Installing $LATEST and restarting." "$LATEST"
+  local keep=""; was_unlocked && keep=handoff
+  ensure_dropins
+  [[ -f "$BIN.prev" ]] && cp -f "$BIN.prev" "$BIN.prev.keep"
+  cp -f "$BIN" "$BIN.prev"
+  install -m 0755 "$x/syphon" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+  for f in syphon-update syphon-ctl; do
+    install -m 0755 "$x/$f" "$BINDIR/$f.new" && mv -f "$BINDIR/$f.new" "$BINDIR/$f"
+  done
+  # the installer adjusts the data folder in the helper; keep what this machine already uses
+  sed -i "s|; DATA=/var/lib/syphon\$|; DATA=$DATA|" "$BINDIR/syphon-update" 2>/dev/null
+  sed -i "s|^DATA=.*|DATA=\"\${SYPHON_DATA:-$DATA}\"|" "$BINDIR/syphon-ctl" 2>/dev/null
+  restart_node $keep
+  if healthy; then
+    if [[ -n "$keep" ]] && unlocked; then status done "Updated to $LATEST. The library stayed unlocked." "$LATEST"
+    elif [[ -n "$keep" ]]; then status done "Updated to $LATEST. Sign in to unlock the library." "$LATEST"
+    else status done "Updated to $LATEST." "$LATEST"; fi
+    rm -f "$BIN.prev.keep"
+    return 0
+  fi
+  # it did not come up: the old program goes back (and "the version before" stays what it was)
+  cp -f "$BIN.prev" "$BIN"
+  if [[ -f "$BIN.prev.keep" ]]; then mv -f "$BIN.prev.keep" "$BIN.prev"; fi
+  restart_node $keep
+  if healthy; then status rolledback "$LATEST did not start properly, so $cur was put back." "$LATEST"; return 0; fi
+  # still not: the new version may have changed the database, so put the saved copy back too
+  if restore_db "$snap"; then
+    systemctl start syphon
+    if healthy; then status rolledback "$LATEST did not start, so $cur and the database saved before the update were put back." "$LATEST"; return 0; fi
+  fi
+  status failed "The update failed and the node would not start again. The saved database is in $SNAPS/$snap. Check: journalctl -u syphon" "$LATEST"
+}
+
+do_rollback() {
+  [[ -f "$BIN.prev" ]] || { status failed "There is no earlier version to go back to."; return 0; }
+  local cur; cur="$(current)"
+  local keep=""; was_unlocked && keep=handoff
+  cp -f "$BIN" "$BIN.tmp" && cp -f "$BIN.prev" "$BIN" && mv -f "$BIN.tmp" "$BIN.prev"
+  restart_node $keep
+  if healthy; then status done "Went back to $(current)."; return 0; fi
+  # the earlier program may not read a database the newer one changed: try the copy saved before that update
+  local snap; snap="$(ls -1t "$SNAPS" 2>/dev/null | head -n1)"
+  if [[ -n "$snap" ]] && restore_db "$snap"; then
+    systemctl start syphon
+    if healthy; then status done "Went back to $(current). The database saved before the update was restored, so changes made since then are not in it."; return 0; fi
+  fi
+  status failed "The earlier version did not start either. Check: journalctl -u syphon"
+}
+
+# Kill node: remove everything Syphon put on this computer. Shared programs installed from the package
+# manager (tor, ffmpeg, clamav, bubblewrap, ...) are left alone because other things may use them.
+do_kill() {
+  # never run against anything that does not look like a Syphon data folder
+  # DATA comes from the installer, but never run this against a system folder or a missing one. The node may already
+  # have wiped its own files by the time this runs, so the folder is not required to hold any.
+  case "$DATA" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/lib/*/*/*)
+      status failed "Kill node stopped: $DATA is not a Syphon data folder. Nothing was removed."; return 0 ;;
+  esac
+  [[ -d "$DATA" ]] || { status failed "Kill node: $DATA does not exist, so there is no data to remove."; }
+  status killing "Removing this node from the computer…"
+  systemctl stop syphon-update.path 2>/dev/null
+  systemctl disable --now syphon-torify.service 2>/dev/null
+  command -v nft >/dev/null && nft delete table inet syphon_torify 2>/dev/null
+  systemctl disable --now syphon.service 2>/dev/null
+  pkill -u syphon 2>/dev/null
+  sleep 1
+  # overwrite the key files before unlinking them, then remove the whole data folder (library, vault, keys, Tor state)
+  if command -v shred >/dev/null; then
+    find "$DATA" -maxdepth 2 \( -name 'keyring.json' -o -name 'vault.json' -o -name '*.key' -o -name '*.db' \) -type f -exec shred -u -n 1 {} + 2>/dev/null
+  fi
+  rm -rf --one-file-system "$DATA"
+  rm -f "$BIN" "$BIN.prev" "$BIN.new" /usr/local/bin/syphon-ctl
+  # network drives linked from the web page: disconnect them (the files on them are not touched) and forget the passwords
+  for u in /etc/systemd/system/mnt-syphon-*.mount; do [[ -e "$u" ]] && { systemctl disable --now "$(basename "$u")" 2>/dev/null; rm -f "$u"; }; done
+  rm -f /etc/syphon/nas-*.cred; rm -rf /etc/systemd/system/syphon.service.d
+  systemctl disable --now syphon-wol.service 2>/dev/null
+  rm -f /etc/systemd/system/syphon-wol.service
+  rm -rf /run/syphon-handoff
+  rm -f /etc/systemd/system/syphon.service /etc/systemd/system/syphon-torify.service /etc/systemd/system/syphon-update.service /etc/systemd/system/syphon-update.path
+  rm -f /etc/sysctl.d/60-syphon-sandbox.conf
+  rm -rf /etc/syphon /opt/syphon-src /tmp/syphon-update.err /tmp/syphon-update.build
+  systemctl daemon-reload 2>/dev/null
+  id -u syphon >/dev/null 2>&1 && userdel syphon 2>/dev/null
+  getent group syphon >/dev/null && groupdel syphon 2>/dev/null
+  rm -f /usr/local/bin/syphon-update
+  exit 0
+}
+
+# ---- storage: let the node use more drives, and link or remove a network share (NAS)
+sstatus() { # message, ok|failed
+  local tmp; tmp="$(mktemp "$UPD/.ss.XXXXXX")"
+  printf '{"state":"%s","message":"%s","updated":%s}\n' "${2:-done}" "$(clean "$1")" "$(date +%s)" >"$tmp"
+  chown syphon:syphon "$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" "$UPD/storage-status.json"
+}
+safe_dir() { # an absolute path that is not a system folder
+  case "$1" in
+    /*) ;; *) return 1 ;;
+  esac
+  [[ "$1" == *..* ]] && return 1
+  case "$1" in
+    /|/bin|/boot|/dev|/etc|/lib|/lib64|/proc|/root|/run|/sbin|/sys|/tmp|/usr|/var|/home|/opt|/bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*) return 1 ;;
+  esac
+  return 0
+}
+field() { printf '%s\n' "$REQ" | grep -m1 "^$1=" | cut -d= -f2-; }
+write_dropin() { # every folder the node may write to, one per line in /etc/syphon/storage-paths
+  install -d /etc/syphon /etc/systemd/system/syphon.service.d
+  touch /etc/syphon/storage-paths
+  { echo "[Service]"; while IFS= read -r p; do [[ -n "$p" ]] && printf 'ReadWritePaths=-%s\n' "$p"; done </etc/syphon/storage-paths; } >/etc/systemd/system/syphon.service.d/storage.conf
+  systemctl daemon-reload
+}
+do_storage_allow() {
+  local p; p="$(field path)"
+  safe_dir "$p" || { sstatus "Refused: $p is not a usable folder." failed; return 0; }
+  install -d -o syphon -g syphon -m 0700 "$p" 2>/dev/null || { sstatus "Could not create $p." failed; return 0; }
+  chown syphon:syphon "$p"
+  touch /etc/syphon/storage-paths 2>/dev/null || { install -d /etc/syphon; touch /etc/syphon/storage-paths; }
+  if ! grep -qxF "$p" /etc/syphon/storage-paths; then
+    echo "$p" >>/etc/syphon/storage-paths
+    write_dropin
+    case "$p" in /mnt/*|/media/*|/srv/*) ;; *) systemctl restart syphon ;; esac
+  fi
+  sstatus "Syphon may now use $p." done
+}
+do_nas_add() {
+  local label slug proto host share user pass mnt sub unit what type opts cred
+  label="$(field label)"; slug="$(field slug)"; proto="$(field proto)"; host="$(field host)"; share="$(field share)"
+  user="$(field user)"; pass="$(field pass)"; mnt="$(field mount)"; sub="$(field sub)"
+  [[ "$slug" =~ ^[a-z0-9-]{1,30}$ ]] || { sstatus "Refused: bad name." failed; return 0; }
+  [[ "$mnt" == "/mnt/syphon/$slug" ]] || { sstatus "Refused: bad mount point." failed; return 0; }
+  [[ "$host" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] || { sstatus "Refused: bad address." failed; return 0; }
+  [[ "$share" =~ ^[A-Za-z0-9\ _.\$/-]{1,200}$ && "$share" != *..* ]] || { sstatus "Refused: bad share name." failed; return 0; }
+  [[ "$sub" != *..* && "$sub" =~ ^[A-Za-z0-9\ _./-]{1,200}$ ]] || { sstatus "Refused: bad folder name." failed; return 0; }
+  install -d -m 0755 "$mnt"
+  unit="$(systemd-escape -p --suffix=mount "$mnt")"
+  case "$proto" in
+    nfs)
+      command -v mount.nfs >/dev/null || { sstatus "NFS support is missing. Run: sudo apt install nfs-common" failed; return 0; }
+      what="$host:/$share"; type=nfs; opts="soft,timeo=150,retrans=3,nofail,_netdev,x-systemd.mount-timeout=30" ;;
+    smb)
+      command -v mount.cifs >/dev/null || { sstatus "SMB support is missing. Run: sudo apt install cifs-utils" failed; return 0; }
+      cred="/etc/syphon/nas-$slug.cred"; install -d -m 0755 /etc/syphon
+      ( umask 077; printf 'username=%s\npassword=%s\n' "$user" "$pass" >"$cred" ); chmod 0600 "$cred"
+      what="//$host/$share"; type=cifs
+      opts="credentials=$cred,uid=$(id -u syphon),gid=$(id -g syphon),file_mode=0600,dir_mode=0700,nofail,_netdev,x-systemd.mount-timeout=30" ;;
+    *) sstatus "Refused: unknown type." failed; return 0 ;;
+  esac
+  printf '[Unit]\nDescription=Syphon network drive %s\nAfter=network-online.target\nWants=network-online.target\n\n[Mount]\nWhat=%s\nWhere=%s\nType=%s\nOptions=%s\n\n[Install]\nWantedBy=multi-user.target\n' "$slug" "$what" "$mnt" "$type" "$opts" >"/etc/systemd/system/$unit"
+  systemctl daemon-reload
+  systemctl enable "$unit" >/dev/null 2>&1
+  if ! systemctl restart "$unit" 2>/tmp/syphon-nas.err; then
+    sstatus "Could not connect to $host: $(head -c 160 /tmp/syphon-nas.err). Check the address, share name and password." failed; return 0
+  fi
+  mountpoint -q "$mnt" || { sstatus "The share did not mount." failed; return 0; }
+  runuser -u syphon -- mkdir -p "$mnt/$sub" 2>/dev/null || { sstatus "Connected, but Syphon is not allowed to write in the share. On the NAS, give this computer's user write access." failed; return 0; }
+  sstatus "Connected to $label." done
+}
+do_nas_remove() {
+  local slug mnt unit; slug="$(field slug)"; mnt="$(field mount)"
+  [[ "$slug" =~ ^[a-z0-9-]{1,30}$ && "$mnt" == "/mnt/syphon/$slug" ]] || { sstatus "Refused." failed; return 0; }
+  unit="$(systemd-escape -p --suffix=mount "$mnt")"
+  systemctl disable --now "$unit" 2>/dev/null
+  rm -f "/etc/systemd/system/$unit" "/etc/syphon/nas-$slug.cred"
+  rmdir "$mnt" 2>/dev/null
+  systemctl daemon-reload
+  sstatus "Disconnected. The files on the share were not touched." done
+}
+
+# ---- sleep: suspend the computer when the node asks (it decides when; this only does it)
+do_suspend() {
+  local wake iface
+  wake="$(field wake)"
+  [[ -z "$wake" || "$wake" =~ ^[0-9]{9,11}$ ]] || return 0
+  # the network card must listen for wake packets while the computer sleeps (some cards forget it at every start)
+  iface="$(awk 'NR>1 && $2=="00000000" {print $1; exit}' /proc/net/route)"
+  if [[ -n "$iface" ]] && command -v ethtool >/dev/null; then ethtool -s "$iface" wol g 2>/dev/null; fi
+  # the clock's wake time (nothing is set when there is none, and an older one is cleared)
+  if command -v rtcwake >/dev/null; then
+    rtcwake -m disable >/dev/null 2>&1
+    [[ -n "$wake" ]] && rtcwake -m no -t "$wake" >/dev/null 2>&1
+  fi
+  sync
+  systemctl suspend
+}
+
+# ---- older versions could suspend the computer ("deep sleep"). That feature is gone: remove what it left behind.
+do_cleanup_sleep() {
+  systemctl disable --now syphon-wol.service 2>/dev/null
+  rm -f /etc/systemd/system/syphon-wol.service "$UPD/sleep-status.json"
+  systemctl daemon-reload 2>/dev/null
+}
+
+case "${1:-run}" in
+  cleanup-sleep) do_cleanup_sleep ;;
+  kill) do_kill ;;
+  storage-allow) REQ="path=$2"; do_storage_allow ;;
+  check) do_check ;;
+  apply) do_apply ;;
+  rollback) do_rollback ;;
+  run)
+    for f in "$UPD"/requests/*.req; do
+      [[ -e "$f" ]] || continue
+      REQ="$(cat "$f")"; rm -f "$f"
+      act="$(printf '%s\n' "$REQ" | head -n1 | tr -d '[:space:]')"
+      case "$act" in
+        kill) do_kill ;; check) do_check ;; apply) do_apply ;; rollback) do_rollback ;;
+        storage-allow) do_storage_allow ;; nas-add) do_nas_add ;; nas-remove) do_nas_remove ;;
+        cleanup-sleep) do_cleanup_sleep ;;
+        suspend) do_suspend ;;
+      esac
+      REQ=""; AFTER=""
+    done ;;
+  *) echo "usage: syphon-update check|apply|rollback|kill|run"; exit 2 ;;
+esac

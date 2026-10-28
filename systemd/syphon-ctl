@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# syphon-ctl: change how this Syphon node behaves. Run with sudo.
+#   syphon-ctl status
+#   syphon-ctl persistence on|off     keep unfinished work through power loss (on) or forget it (off)
+#   syphon-ctl perf dedicated|shared  size the limits from this computer (dedicated) or keep them small (shared)
+#   syphon-ctl torify on|off          send ALL of this computer's traffic through Tor
+#   syphon-ctl bridge add "LINE"     use a Tor bridge (for networks that block Tor or to hide Tor use)
+#   syphon-ctl bridge clear           go back to connecting to Tor directly
+#   syphon-ctl update-source set URL --signers FILE [--direct]   where updates come from (signed releases only)
+#   syphon-ctl update check|apply|rollback|status
+#   syphon-ctl storage allow PATH     let Syphon use another drive's folder (the web page's Settings > Storage does this too)
+#   syphon-ctl kill                   permanently delete this node, its data and the program (asks first)
+set -euo pipefail
+DATA="${SYPHON_DATA:-/var/lib/syphon}"
+BIN=/usr/local/bin/syphon
+UNIT=/etc/systemd/system/syphon.service
+[[ $EUID -eq 0 ]] || { exec sudo -E "$0" "$@"; }
+rv() { runuser -u syphon -- "$BIN" --dir "$DATA" "$@"; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+cmd="${1:-status}"; val="${2:-}"
+case "$cmd" in
+  status)
+    echo "Syphon service:   $(systemctl is-active syphon || true)"
+    grep -E '^persistence' "$DATA/config.toml" | sed 's/^/Power mode:        /' || true
+    grep -E 'bridges *=' "$DATA/config.toml" | sed 's/^ */Bridges:           /' || true
+    grep -E 'system_wide' "$DATA/config.toml" | sed 's/^ */System-wide Tor:    /' || true
+    if nft list table inet syphon_torify >/dev/null 2>&1; then echo "Firewall:          system-wide Tor rules are ACTIVE"; else echo "Firewall:          system-wide Tor rules are off"; fi ;;
+  persistence)
+    case "$val" in
+      on)  rv set persistence on;  sed -i 's/^Restart=.*/Restart=always/' "$UNIT" ;;
+      off) rv set persistence off; sed -i 's/^Restart=.*/Restart=on-failure/' "$UNIT" ;;
+      *) usage ;;
+    esac
+    systemctl daemon-reload; systemctl restart syphon; echo "Done: persistence $val." ;;
+  perf)
+    case "$val" in
+      dedicated|shared) rv set perf "$val"; systemctl restart syphon; echo "Done: performance $val." ;;
+      show|"") "$BIN" perf ;;
+      *) usage ;;
+    esac ;;
+  bridge)
+    case "$val" in
+      add)
+        line="${3:-}"; [[ -n "$line" ]] || { echo 'Give the bridge line in quotes, e.g. syphon-ctl bridge add "obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0"'; exit 2; }
+        DEBIAN_FRONTEND=noninteractive apt-get install -y obfs4proxy snowflake-client >/dev/null 2>&1 || echo "(could not install obfs4proxy/snowflake-client automatically; install them if the bridge needs them)"
+        rv set bridge "$line" ;;
+      clear) rv set bridge clear ;;
+      *) usage ;;
+    esac
+    systemctl restart syphon; echo "Done. Tor restarts and connects through the bridge (can take a minute)." ;;
+  torify)
+    command -v nft >/dev/null || { echo "This needs nftables: sudo apt install nftables"; exit 1; }
+    case "$val" in
+      on)
+        rv set system-wide on
+        install -m 0644 "$(dirname "$0")/syphon-torify.service" /etc/systemd/system/syphon-torify.service 2>/dev/null || true
+        [[ -f /etc/systemd/system/syphon-torify.service ]] || { echo "missing syphon-torify.service"; exit 1; }
+        systemctl daemon-reload
+        systemctl restart syphon           # Tor starts its transparent proxy ports
+        sleep 3
+        systemctl enable --now syphon-torify
+        echo "Done. This computer's traffic now goes through Tor. Tor takes a minute to connect; until then other programs here cannot reach the internet (that is the point)." ;;
+      off)
+        systemctl disable --now syphon-torify 2>/dev/null || true
+        nft delete table inet syphon_torify 2>/dev/null || true
+        rv set system-wide off
+        systemctl restart syphon
+        echo "Done. This computer's traffic goes out normally again." ;;
+      *) usage ;;
+    esac ;;
+  update-source)
+    [[ "$val" == "set" ]] || usage
+    url="${3:-}"; [[ -n "$url" ]] || usage
+    signers=""; route=tor
+    shift 3
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --signers) signers="$2"; shift 2 ;;
+        --direct) route=direct; shift ;;
+        *) usage ;;
+      esac
+    done
+    case "$url" in https://*) ;; *) echo "The update address must start with https://"; exit 1 ;; esac
+    install -d -m 0755 /etc/syphon
+    if [[ -n "$signers" ]]; then install -m 0644 "$signers" /etc/syphon/allowed_signers; fi
+    if [[ ! -s /etc/syphon/allowed_signers ]]; then
+      echo "Updates are only installed if the release is SIGNED by you. Give your signers file with --signers FILE"
+      echo "(see RELEASING.md in the repository). There is no way to skip this."
+      exit 1
+    fi
+    printf 'REPO="%s"\nROUTE=%s\nSOCKS=127.0.0.1:9250\nDATA="%s"\n' "$url" "$route" "$DATA" > /etc/syphon/update.conf
+    install -d -o syphon -g syphon -m 0755 "$DATA/update" "$DATA/update/requests"
+    systemctl daemon-reload; systemctl enable --now syphon-update.path >/dev/null 2>&1 || true
+    echo "Done. Updates will come from $url (signed releases only)."
+    echo "Use the Update button in Settings, or: sudo syphon-ctl update check" ;;
+  update)
+    case "$val" in
+      check|apply|rollback) exec /usr/local/bin/syphon-update "$val" ;;
+      status) cat "$DATA/update/status.json" 2>/dev/null || echo "No update has been checked yet." ;;
+      *) usage ;;
+    esac ;;
+  storage)
+    case "$val" in
+      allow) [[ -n "${3:-}" ]] || usage; exec /usr/local/bin/syphon-update storage-allow "$3" ;;
+      *) usage ;;
+    esac ;;
+  kill)
+    read -r -p 'This permanently deletes ALL data on this node and removes Syphon. Type KILL NODE to continue: ' ans
+    [[ "$ans" == "KILL NODE" ]] || { echo "Cancelled. Nothing was removed."; exit 1; }
+    exec /usr/local/bin/syphon-update kill ;;
+  *) usage ;;
+esac
