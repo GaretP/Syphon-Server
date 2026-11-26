@@ -1,0 +1,9 @@
+[Unit]
+Description=Start the Syphon update runner when the web page asks for an update
+
+[Path]
+DirectoryNotEmpty=/var/lib/syphon/update/requests
+Unit=syphon-update.service
+
+[Install]
+WantedBy=multi-user.target
